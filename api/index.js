@@ -12,11 +12,11 @@ const PREFIX = 'modp_';
 const CACHE = {
     data: null,
     timestamp: 0,
-    ttl: 10 * 60 * 1000 // 10 menit
+    ttl: 15 * 60 * 1000 // Cache diperpanjang jadi 15 menit agar ngebut
 };
 
 const http = axios.create({
-    timeout: 10000,
+    timeout: 8000,
     headers: { 'User-Agent': UA }
 });
 
@@ -24,22 +24,27 @@ async function listDriveFolder(folderId) {
     if (!GDRIVE_API_KEY) {
         throw new Error('GDRIVE_API_KEY belum terbaca di Environment Variables Vercel.');
     }
-    const files = [];
-    let pageToken = null;
-    do {
-        const { data } = await http.get('https://www.googleapis.com/drive/v3/files', {
-            params: {
-                q: `'${folderId.trim()}' in parents and trashed = false`,
-                fields: 'nextPageToken, files(id, name, mimeType, size, thumbnailLink)',
-                pageSize: 100,
-                pageToken: pageToken || undefined,
-                key: GDRIVE_API_KEY
-            }
-        });
-        if (data && Array.isArray(data.files)) files.push(...data.files);
-        pageToken = data.nextPageToken;
-    } while (pageToken);
-    return files;
+    try {
+        const files = [];
+        let pageToken = null;
+        do {
+            const { data } = await http.get('https://www.googleapis.com/drive/v3/files', {
+                params: {
+                    q: `'${folderId.trim()}' in parents and trashed = false`,
+                    fields: 'nextPageToken, files(id, name, mimeType, size, thumbnailLink)',
+                    pageSize: 100,
+                    pageToken: pageToken || undefined,
+                    key: GDRIVE_API_KEY
+                }
+            });
+            if (data && Array.isArray(data.files)) files.push(...data.files);
+            pageToken = data.nextPageToken;
+        } while (pageToken);
+        return files;
+    } catch (e) {
+        console.error('Error listDriveFolder:', e.message);
+        return [];
+    }
 }
 
 function isVideo(file) {
@@ -61,7 +66,7 @@ function driveImageUrl(fileId, width = 1000) {
 async function fetchJsonFile(fileId) {
     try {
         const url = `https://drive.google.com/uc?export=download&id=${fileId}`;
-        const { data } = await http.get(url, { responseType: 'text', timeout: 5000 });
+        const { data } = await http.get(url, { responseType: 'text', timeout: 4000 });
         if (!data || typeof data !== 'string' || data.includes('<!DOCTYPE html>')) return null;
 
         const cleaned = data
@@ -71,7 +76,6 @@ async function fetchJsonFile(fileId) {
 
         return JSON.parse(cleaned);
     } catch (e) {
-        console.error('Gagal baca info.json:', e.message);
         return null;
     }
 }
@@ -129,14 +133,7 @@ async function scanLibrary(force = false) {
 
             for (const vf of videoFiles) {
                 const baseName = stripExt(vf.name);
-                const lowerBase = baseName.toLowerCase();
-
-                let categoryLabel = 'Performance';
-                if (/^rehearsal/i.test(lowerBase)) {
-                    categoryLabel = 'Rehearsal';
-                }
-
-                const matchedThumb = imageFiles.find(img => stripExt(img.name).toLowerCase() === lowerBase);
+                const matchedThumb = imageFiles.find(img => stripExt(img.name).toLowerCase() === baseName.toLowerCase());
                 const thumbUrl = matchedThumb
                     ? driveImageUrl(matchedThumb.id, 1280)
                     : (vf.thumbnailLink ? vf.thumbnailLink.replace(/=s\d+/, '=s1280') : driveImageUrl(vf.id, 1280));
@@ -144,13 +141,13 @@ async function scanLibrary(force = false) {
                 episodes.push({
                     id: `${PREFIX}${sf.id}:${vf.id}`,
                     fileId: vf.id,
-                    title: baseName, // Bersih sesuai nama file
+                    title: baseName,
                     fullTitle: `${title} – ${baseName}`,
-                    season: 1, // Semua disatukan dalam 1 tab utama
+                    season: 1,
                     episode: epNum++,
                     thumbnail: thumbUrl,
                     released: date ? `${date}T00:00:00.000Z` : undefined,
-                    overview: `${categoryLabel} • ${title} (${displayName})`
+                    overview: `${baseName} • ${title} (${displayName})`
                 });
             }
 
@@ -176,4 +173,205 @@ async function scanLibrary(force = false) {
         }
 
         teams.push({
-            id:
+            id: catalogId,
+            folderId: tf.id,
+            name: displayName,
+            logo: teamLogoUrl,
+            shows
+        });
+    }
+
+    CACHE.data = { teams };
+    CACHE.timestamp = now;
+    return CACHE.data;
+}
+
+async function getAddonInterface() {
+    const lib = await scanLibrary();
+    const catalogs = lib.teams.map(t => ({
+        type: 'series',
+        id: t.id,
+        name: t.name,
+        extra: [{ name: 'search', isRequired: false }, { name: 'skip', isRequired: false }]
+    }));
+
+    if (catalogs.length === 0) {
+        catalogs.push({
+            type: 'series',
+            id: 'team_default',
+            name: 'Move On Dance Pro',
+            extra: [{ name: 'search', isRequired: false }]
+        });
+    }
+
+    const manifest = {
+        id: 'org.moveondancepro.library',
+        version: '1.1.2',
+        name: 'Dance Library - Move On Dance Pro',
+        description: 'Katalog resmi video dokumentasi Move On Dance Pro',
+        resources: ['catalog', 'meta', 'stream'],
+        types: ['series'],
+        catalogs,
+        idPrefixes: [PREFIX]
+    };
+
+    const builder = new addonBuilder(manifest);
+
+    builder.defineCatalogHandler(async (args) => {
+        try {
+            const libData = await scanLibrary();
+            const team = libData.teams.find(t => t.id === args.id);
+            if (!team) return { metas: [] };
+
+            let list = team.shows;
+            if (args.extra && args.extra.search) {
+                const q = args.extra.search.toLowerCase().trim();
+                list = list.filter(s =>
+                    s.title.toLowerCase().includes(q) ||
+                    s.description.toLowerCase().includes(q) ||
+                    (s.date && s.date.includes(q))
+                );
+            }
+
+            const skip = parseInt(args.extra && args.extra.skip, 10) || 0;
+            const sliced = list.slice(skip, skip + 50);
+
+            const metas = sliced.map(s => ({
+                id: s.id,
+                type: 'series',
+                name: s.title,
+                poster: s.poster,
+                posterShape: 'poster',
+                background: s.background,
+                logo: s.logo,
+                releaseInfo: s.releaseInfo,
+                description: s.description
+            }));
+
+            return { metas, cacheMaxAge: 300 };
+        } catch (err) {
+            return { metas: [] };
+        }
+    });
+
+    builder.defineMetaHandler(async (args) => {
+        try {
+            const libData = await scanLibrary();
+            for (const team of libData.teams) {
+                const show = team.shows.find(s => s.id === args.id);
+                if (show) {
+                    return {
+                        meta: {
+                            id: show.id,
+                            type: 'series',
+                            name: show.title,
+                            poster: show.poster,
+                            posterShape: 'poster',
+                            background: show.background,
+                            logo: show.logo,
+                            releaseInfo: show.releaseInfo,
+                            description: show.description,
+                            videos: show.videos.map(v => ({
+                                id: v.id,
+                                title: v.title,
+                                season: v.season,
+                                episode: v.episode,
+                                thumbnail: v.thumbnail,
+                                released: v.released,
+                                overview: v.overview
+                            }))
+                        },
+                        cacheMaxAge: 300
+                    };
+                }
+            }
+            return { meta: { id: args.id, type: 'series', name: 'Show Not Found' } };
+        } catch (err) {
+            return { meta: { id: args.id, type: 'series', name: 'Error' } };
+        }
+    });
+
+    builder.defineStreamHandler(async (args) => {
+        try {
+            const raw = args.id.replace(PREFIX, '');
+            const [folderId, fileId] = raw.split(':');
+            if (!fileId) return { streams: [] };
+
+            const libData = await scanLibrary();
+            let teamName = 'Move On Dance Pro';
+            let videoLabel = 'Play Video';
+
+            for (const team of libData.teams) {
+                const show = team.shows.find(s => s.folderId === folderId);
+                if (show) {
+                    teamName = team.name;
+                    const ep = show.videos.find(v => v.fileId === fileId);
+                    if (ep) videoLabel = ep.fullTitle;
+                    break;
+                }
+            }
+
+            const directUrl = GDRIVE_API_KEY
+                ? `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${GDRIVE_API_KEY}`
+                : `https://drive.usercontent.google.com/download?id=${fileId}&export=download&confirm=t`;
+
+            const streams = [
+                {
+                    name: teamName,
+                    title: `${videoLabel}\nGoogle Drive Direct Stream`,
+                    url: directUrl,
+                    behaviorHints: { notWebReady: false }
+                }
+            ];
+
+            return { streams, cacheMaxAge: 300 };
+        } catch (err) {
+            return { streams: [] };
+        }
+    });
+
+    return builder.getInterface();
+}
+
+const app = express();
+app.use(cors());
+
+app.get('/', (req, res) => res.redirect('/manifest.json'));
+
+app.get('/debug', async (req, res) => {
+    try {
+        const lib = await scanLibrary(req.query.refresh === '1');
+        res.json({
+            status: 'ok',
+            usingApiKey: !!GDRIVE_API_KEY,
+            teams: lib.teams.map(t => ({
+                name: t.name,
+                shows: t.shows.map(s => ({
+                    title: s.title,
+                    description: s.description,
+                    videos: s.videos.map(v => ({ title: v.title, season: v.season, episode: v.episode }))
+                }))
+            }))
+        });
+    } catch (e) {
+        res.status(200).json({
+            status: 'error',
+            usingApiKey: !!GDRIVE_API_KEY,
+            message: e.response?.data?.error?.message || e.message
+        });
+    }
+});
+
+app.use(async (req, res, next) => {
+    try {
+        const addonInterface = await getAddonInterface();
+        const router = getRouter(addonInterface);
+        router(req, res, next);
+    } catch (err) {
+        res.status(500).json({
+            error: err.response?.data?.error?.message || err.message
+        });
+    }
+});
+
+module.exports = app;
