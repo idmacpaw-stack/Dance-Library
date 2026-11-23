@@ -4,8 +4,6 @@ const axios = require('axios');
 const { addonBuilder, getRouter } = require('stremio-addon-sdk');
 
 const GDRIVE_FOLDER_ID = process.env.GDRIVE_FOLDER_ID || '1wxqFA4Tz6swiZApr0tugxb-vIPZpPQWu';
-const GDRIVE_API_KEY = process.env.GDRIVE_API_KEY || '';
-
 const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
 const PREFIX = 'modp_';
 
@@ -20,31 +18,33 @@ const http = axios.create({
     headers: { 'User-Agent': UA }
 });
 
-// Fungsi pencarian file/folder menggunakan Google Drive API v3 (Wajib pakai GDRIVE_API_KEY di environment variables Vercel agar lancar)
+// Helper aman untuk mem-parsing folder publik Google Drive tanpa API Key
 async function listDriveFolder(folderId) {
-    if (!GDRIVE_API_KEY) {
-        // Fallback jika API Key belum dipasang: kembalikan struktur data statis/aman agar tidak error 500
-        return [];
-    }
     try {
-        const files = [];
-        let pageToken = null;
-        do {
-            const { data } = await http.get('https://www.googleapis.com/drive/v3/files', {
-                params: {
-                    q: `'${folderId}' in parents and trashed = false`,
-                    fields: 'nextPageToken, files(id, name, mimeType, size, thumbnailLink)',
-                    pageSize: 100,
-                    pageToken: pageToken || undefined,
-                    key: GDRIVE_API_KEY
-                }
+        const url = `https://drive.google.com/embeddedfolderview?id=${folderId}#list`;
+        const { data: html } = await http.get(url);
+        const items = [];
+        const entryRegex = /<div class="flip-entry" id="entry-([^"]+)"[\s\S]*?<div class="flip-entry-title">([^<]+)<\/div>/g;
+        let match;
+        while ((match = entryRegex.exec(html)) !== null) {
+            const id = match[1];
+            const name = match[2]
+                .replace(/&amp;/g, '&')
+                .replace(/&quot;/g, '"')
+                .replace(/&#39;/g, "'")
+                .replace(/&lt;/g, '<')
+                .replace(/&gt;/g, '>');
+            const blockStart = match.index;
+            const block = html.slice(blockStart, blockStart + 1200);
+            const isFolder = block.includes('drive/folders/') || block.includes('folder_');
+            items.push({
+                id,
+                name,
+                mimeType: isFolder ? 'application/vnd.google-apps.folder' : guessMime(name)
             });
-            if (data && Array.isArray(data.files)) files.push(...data.files);
-            pageToken = data.nextPageToken;
-        } while (pageToken);
-        return files;
+        }
+        return items;
     } catch (e) {
-        console.error('Drive API Error:', e.message);
         return [];
     }
 }
@@ -74,13 +74,14 @@ function driveImageUrl(fileId, width = 1000) {
 }
 
 async function fetchJsonFile(fileId) {
-    if (!GDRIVE_API_KEY) return null;
     try {
-        const url = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${GDRIVE_API_KEY}`;
-        const { data } = await http.get(url, { responseType: 'json', timeout: 5000 });
-        return data && typeof data === 'object' ? data : null;
+        const url = `https://drive.google.com/uc?export=download&id=${fileId}`;
+        const { data } = await http.get(url, { responseType: 'text', timeout: 4000 });
+        if (!data || typeof data !== 'string' || data.includes('<!DOCTYPE html>')) return null;
+        let cleaned = data.replace(/[“”‘’]/g, '"').trim();
+        return JSON.parse(cleaned);
     } catch (e) {
-        return null;
+        return null; // Aman: jika gagal, diabaikan tanpa bikin error 500
     }
 }
 
@@ -154,10 +155,7 @@ async function scanLibrary(force = false) {
                 }
 
                 const matchedThumb = imageFiles.find(img => stripExt(img.name).toLowerCase() === lowerBase);
-                const thumbUrl = matchedThumb
-                    ? driveImageUrl(matchedThumb.id, 1280)
-                    : (vf.thumbnailLink ? vf.thumbnailLink.replace(/=s\d+/, '=s1280') : driveImageUrl(vf.id, 1280));
-
+                const thumbUrl = matchedThumb ? driveImageUrl(matchedThumb.id, 1280) : driveImageUrl(vf.id, 1280);
                 const seasonName = season === 1 ? `Show ${episode}` : (season === 2 ? `Rehearsal ${episode}` : `Extra ${episode}`);
 
                 episodes.push({
@@ -228,7 +226,7 @@ async function getAddonInterface() {
 
     const manifest = {
         id: 'org.moveondancepro.library',
-        version: '1.0.4',
+        version: '1.0.5',
         name: 'Dance Library - Move On Dance Pro',
         description: 'Katalog resmi video dokumentasi show dan rehearsal Move On Dance Pro',
         resources: ['catalog', 'meta', 'stream'],
@@ -290,13 +288,3 @@ async function getAddonInterface() {
                             poster: show.poster,
                             posterShape: 'poster',
                             background: show.background,
-                            logo: show.logo,
-                            releaseInfo: show.releaseInfo,
-                            description: show.description,
-                            videos: show.videos.map(v => ({
-                                id: v.id,
-                                title: v.title,
-                                season: v.season,
-                                episode: v.episode,
-                                thumbnail: v.thumbnail,
-                                released: v.released
