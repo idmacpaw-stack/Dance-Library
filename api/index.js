@@ -4,6 +4,8 @@ const axios = require('axios');
 const { addonBuilder, getRouter } = require('stremio-addon-sdk');
 
 const GDRIVE_FOLDER_ID = process.env.GDRIVE_FOLDER_ID || '1wxqFA4Tz6swiZApr0tugxb-vIPZpPQWu';
+const GDRIVE_API_KEY = process.env.GDRIVE_API_KEY || ''; // Masukkan API Key kamu di sini atau lewat Environment Variables Vercel
+
 const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
 const PREFIX = 'modp_';
 
@@ -14,39 +16,31 @@ const CACHE = {
 };
 
 const http = axios.create({
-    timeout: 8000,
+    timeout: 10000,
     headers: { 'User-Agent': UA }
 });
 
-// Helper aman untuk mem-parsing folder publik Google Drive tanpa API Key
+// Fungsi pemindaian folder menggunakan Google Drive API v3 resmi
 async function listDriveFolder(folderId) {
-    try {
-        const url = `https://drive.google.com/embeddedfolderview?id=${folderId}#list`;
-        const { data: html } = await http.get(url);
-        const items = [];
-        const entryRegex = /<div class="flip-entry" id="entry-([^"]+)"[\s\S]*?<div class="flip-entry-title">([^<]+)<\/div>/g;
-        let match;
-        while ((match = entryRegex.exec(html)) !== null) {
-            const id = match[1];
-            const name = match[2]
-                .replace(/&amp;/g, '&')
-                .replace(/&quot;/g, '"')
-                .replace(/&#39;/g, "'")
-                .replace(/&lt;/g, '<')
-                .replace(/&gt;/g, '>');
-            const blockStart = match.index;
-            const block = html.slice(blockStart, blockStart + 1200);
-            const isFolder = block.includes('drive/folders/') || block.includes('folder_');
-            items.push({
-                id,
-                name,
-                mimeType: isFolder ? 'application/vnd.google-apps.folder' : guessMime(name)
-            });
-        }
-        return items;
-    } catch (e) {
-        return [];
+    if (!GDRIVE_API_KEY) {
+        throw new Error("GDRIVE_API_KEY belum diatur! Harap isi API Key Google Drive.");
     }
+    const files = [];
+    let pageToken = null;
+    do {
+        const { data } = await http.get('https://www.googleapis.com/drive/v3/files', {
+            params: {
+                q: `'${folderId}' in parents and trashed = false`,
+                fields: 'nextPageToken, files(id, name, mimeType, size, thumbnailLink)',
+                pageSize: 100,
+                pageToken: pageToken || undefined,
+                key: GDRIVE_API_KEY
+            }
+        });
+        if (data && Array.isArray(data.files)) files.push(...data.files);
+        pageToken = data.nextPageToken;
+    } while (pageToken);
+    return files;
 }
 
 function guessMime(filename) {
@@ -75,13 +69,11 @@ function driveImageUrl(fileId, width = 1000) {
 
 async function fetchJsonFile(fileId) {
     try {
-        const url = `https://drive.google.com/uc?export=download&id=${fileId}`;
-        const { data } = await http.get(url, { responseType: 'text', timeout: 4000 });
-        if (!data || typeof data !== 'string' || data.includes('<!DOCTYPE html>')) return null;
-        let cleaned = data.replace(/[“”‘’]/g, '"').trim();
-        return JSON.parse(cleaned);
+        const url = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${GDRIVE_API_KEY}`;
+        const { data } = await http.get(url, { responseType: 'json', timeout: 5000 });
+        return data && typeof data === 'object' ? data : null;
     } catch (e) {
-        return null; // Aman: jika gagal, diabaikan tanpa bikin error 500
+        return null;
     }
 }
 
@@ -226,7 +218,7 @@ async function getAddonInterface() {
 
     const manifest = {
         id: 'org.moveondancepro.library',
-        version: '1.0.5',
+        version: '1.0.6',
         name: 'Dance Library - Move On Dance Pro',
         description: 'Katalog resmi video dokumentasi show dan rehearsal Move On Dance Pro',
         resources: ['catalog', 'meta', 'stream'],
@@ -269,22 +261,4 @@ async function getAddonInterface() {
             }));
 
             return { metas, cacheMaxAge: 300 };
-        } catch (err) {
-            return { metas: [] };
-        }
-    });
-
-    builder.defineMetaHandler(async (args) => {
-        try {
-            const libData = await scanLibrary();
-            for (const team of libData.teams) {
-                const show = team.shows.find(s => s.id === args.id);
-                if (show) {
-                    return {
-                        meta: {
-                            id: show.id,
-                            type: 'series',
-                            name: show.title,
-                            poster: show.poster,
-                            posterShape: 'poster',
-                            background: show.background,
+        } catch (err)
