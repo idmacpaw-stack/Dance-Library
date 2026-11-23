@@ -4,7 +4,7 @@ const axios = require('axios');
 const { addonBuilder, getRouter } = require('stremio-addon-sdk');
 
 const GDRIVE_FOLDER_ID = process.env.GDRIVE_FOLDER_ID || '1wxqFA4Tz6swiZApr0tugxb-vIPZpPQWu';
-const GDRIVE_API_KEY = process.env.GDRIVE_API_KEY || ''; // Masukkan API Key kamu di sini atau lewat Environment Variables Vercel
+const GDRIVE_API_KEY = (process.env.GDRIVE_API_KEY || '').trim();
 
 const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
 const PREFIX = 'modp_';
@@ -20,17 +20,17 @@ const http = axios.create({
     headers: { 'User-Agent': UA }
 });
 
-// Fungsi pemindaian folder menggunakan Google Drive API v3 resmi
+// Pemindaian folder menggunakan Google Drive API v3 resmi
 async function listDriveFolder(folderId) {
     if (!GDRIVE_API_KEY) {
-        throw new Error("GDRIVE_API_KEY belum diatur! Harap isi API Key Google Drive.");
+        throw new Error('GDRIVE_API_KEY belum terbaca di Environment Variables Vercel.');
     }
     const files = [];
     let pageToken = null;
     do {
         const { data } = await http.get('https://www.googleapis.com/drive/v3/files', {
             params: {
-                q: `'${folderId}' in parents and trashed = false`,
+                q: `'${folderId.trim()}' in parents and trashed = false`,
                 fields: 'nextPageToken, files(id, name, mimeType, size, thumbnailLink)',
                 pageSize: 100,
                 pageToken: pageToken || undefined,
@@ -41,14 +41,6 @@ async function listDriveFolder(folderId) {
         pageToken = data.nextPageToken;
     } while (pageToken);
     return files;
-}
-
-function guessMime(filename) {
-    const ext = filename.split('.').pop().toLowerCase();
-    if (['mp4', 'm4v', 'mov', 'mkv'].includes(ext)) return 'video/mp4';
-    if (['jpg', 'jpeg', 'png', 'webp'].includes(ext)) return 'image/jpeg';
-    if (ext === 'json') return 'application/json';
-    return 'application/octet-stream';
 }
 
 function isVideo(file) {
@@ -67,12 +59,23 @@ function driveImageUrl(fileId, width = 1000) {
     return `https://lh3.googleusercontent.com/d/${fileId}=w${width}`;
 }
 
+// Pembaca info.json yang kebal tanda kutip melengkung dan enter/baris baru
 async function fetchJsonFile(fileId) {
+    if (!GDRIVE_API_KEY) return null;
     try {
         const url = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${GDRIVE_API_KEY}`;
-        const { data } = await http.get(url, { responseType: 'json', timeout: 5000 });
-        return data && typeof data === 'object' ? data : null;
+        const { data } = await http.get(url, { responseType: 'text', timeout: 5000 });
+        if (!data) return null;
+
+        const cleaned = String(data)
+            .replace(/[\u201C\u201D]/g, '"')
+            .replace(/[\u2018\u2019]/g, "'")
+            .replace(/[\r\n]+/g, ' ')
+            .trim();
+
+        return JSON.parse(cleaned);
     } catch (e) {
+        console.error('Gagal baca info.json:', e.message);
         return null;
     }
 }
@@ -147,7 +150,10 @@ async function scanLibrary(force = false) {
                 }
 
                 const matchedThumb = imageFiles.find(img => stripExt(img.name).toLowerCase() === lowerBase);
-                const thumbUrl = matchedThumb ? driveImageUrl(matchedThumb.id, 1280) : driveImageUrl(vf.id, 1280);
+                const thumbUrl = matchedThumb
+                    ? driveImageUrl(matchedThumb.id, 1280)
+                    : (vf.thumbnailLink ? vf.thumbnailLink.replace(/=s\d+/, '=s1280') : driveImageUrl(vf.id, 1280));
+
                 const seasonName = season === 1 ? `Show ${episode}` : (season === 2 ? `Rehearsal ${episode}` : `Extra ${episode}`);
 
                 episodes.push({
@@ -218,7 +224,7 @@ async function getAddonInterface() {
 
     const manifest = {
         id: 'org.moveondancepro.library',
-        version: '1.0.6',
+        version: '1.0.7',
         name: 'Dance Library - Move On Dance Pro',
         description: 'Katalog resmi video dokumentasi show dan rehearsal Move On Dance Pro',
         resources: ['catalog', 'meta', 'stream'],
@@ -261,4 +267,129 @@ async function getAddonInterface() {
             }));
 
             return { metas, cacheMaxAge: 300 };
-        } catch (err)
+        } catch (err) {
+            return { metas: [] };
+        }
+    });
+
+    builder.defineMetaHandler(async (args) => {
+        try {
+            const libData = await scanLibrary();
+            for (const team of libData.teams) {
+                const show = team.shows.find(s => s.id === args.id);
+                if (show) {
+                    return {
+                        meta: {
+                            id: show.id,
+                            type: 'series',
+                            name: show.title,
+                            poster: show.poster,
+                            posterShape: 'poster',
+                            background: show.background,
+                            logo: show.logo,
+                            releaseInfo: show.releaseInfo,
+                            description: show.description,
+                            videos: show.videos.map(v => ({
+                                id: v.id,
+                                title: v.title,
+                                season: v.season,
+                                episode: v.episode,
+                                thumbnail: v.thumbnail,
+                                released: v.released,
+                                overview: v.overview
+                            }))
+                        },
+                        cacheMaxAge: 300
+                    };
+                }
+            }
+            return { meta: { id: args.id, type: 'series', name: 'Show Not Found' } };
+        } catch (err) {
+            return { meta: { id: args.id, type: 'series', name: 'Error' } };
+        }
+    });
+
+    builder.defineStreamHandler(async (args) => {
+        try {
+            const raw = args.id.replace(PREFIX, '');
+            const [folderId, fileId] = raw.split(':');
+            if (!fileId) return { streams: [] };
+
+            const libData = await scanLibrary();
+            let teamName = 'Move On Dance Pro';
+            let videoLabel = 'Play Video';
+
+            for (const team of libData.teams) {
+                const show = team.shows.find(s => s.folderId === folderId);
+                if (show) {
+                    teamName = team.name;
+                    const ep = show.videos.find(v => v.fileId === fileId);
+                    if (ep) videoLabel = ep.fullTitle;
+                    break;
+                }
+            }
+
+            const directUrl = GDRIVE_API_KEY
+                ? `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${GDRIVE_API_KEY}`
+                : `https://drive.usercontent.google.com/download?id=${fileId}&export=download&confirm=t`;
+
+            const streams = [
+                {
+                    name: teamName,
+                    title: `${videoLabel}\nGoogle Drive Direct Stream`,
+                    url: directUrl,
+                    behaviorHints: { notWebReady: false }
+                }
+            ];
+
+            return { streams, cacheMaxAge: 300 };
+        } catch (err) {
+            return { streams: [] };
+        }
+    });
+
+    return builder.getInterface();
+}
+
+const app = express();
+app.use(cors());
+
+app.get('/', (req, res) => res.redirect('/manifest.json'));
+
+app.get('/debug', async (req, res) => {
+    try {
+        const lib = await scanLibrary(req.query.refresh === '1');
+        res.json({
+            status: 'ok',
+            usingApiKey: !!GDRIVE_API_KEY,
+            teams: lib.teams.map(t => ({
+                name: t.name,
+                shows: t.shows.map(s => ({
+                    title: s.title,
+                    description: s.description,
+                    videos: s.videos.map(v => ({ title: v.title, season: v.season, episode: v.episode }))
+                }))
+            }))
+        });
+    } catch (e) {
+        res.status(200).json({
+            status: 'error',
+            usingApiKey: !!GDRIVE_API_KEY,
+            message: e.response?.data?.error?.message || e.message
+        });
+    }
+});
+
+app.use(async (req, res, next) => {
+    try {
+        const addonInterface = await getAddonInterface();
+        const router = getRouter(addonInterface);
+        router(req, res, next);
+    } catch (err) {
+        res.status(500).json({
+            error: err.response?.data?.error?.message || err.message
+        });
+    }
+});
+
+module.exports = app;
