@@ -5,16 +5,14 @@ const { addonBuilder, getRouter } = require('stremio-addon-sdk');
 
 const GDRIVE_FOLDER_ID = process.env.GDRIVE_FOLDER_ID || '1wxqFA4Tz6swiZApr0tugxb-vIPZpPQWu';
 const GDRIVE_API_KEY = process.env.GDRIVE_API_KEY || '';
-const BASE_URL = process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : '';
 
 const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
 const PREFIX = 'modp_';
 
-// Cache sederhana di memory (berlaku selama instance serverless hangat)
 const CACHE = {
     data: null,
     timestamp: 0,
-    ttl: 10 * 60 * 1000 // 10 menit
+    ttl: 5 * 60 * 1000 // 5 menit
 };
 
 const http = axios.create({
@@ -22,7 +20,6 @@ const http = axios.create({
     headers: { 'User-Agent': UA }
 });
 
-// Helper: Ambil isi folder Drive menggunakan API Key (jika ada) atau scrape halaman folder publik
 async function listDriveFolder(folderId) {
     if (GDRIVE_API_KEY) {
         const files = [];
@@ -43,7 +40,6 @@ async function listDriveFolder(folderId) {
         return files;
     }
 
-    // Fallback tanpa API Key: parse embedded view Google Drive folder publik
     const url = `https://drive.google.com/embeddedfolderview?id=${folderId}#list`;
     const { data: html } = await http.get(url);
     const items = [];
@@ -99,21 +95,22 @@ function driveImageUrl(fileId, width = 1000) {
 
 async function fetchJsonFile(fileId) {
     try {
-        const { data } = await http.get(`https://drive.google.com/uc?export=download&id=${fileId}`, {
-            responseType: 'text'
-        });
-        // Bersihkan smart quotes (“ ” ‘ ’) yang sering muncul saat copy-paste dari Mac/Notes
-        const cleaned = String(data)
-            .replace(/[“”]/g, '"')
-            .replace(/[‘’]/g, "'");
-        return JSON.parse(cleaned);
+        const url = `https://drive.google.com/uc?export=download&id=${fileId}`;
+        const { data } = await http.get(url, { responseType: 'text' });
+        if (typeof data === 'string' && data.includes('<!DOCTYPE html>')) return null;
+        
+        // Membersihkan berbagai jenis tanda kutip miring (smart quotes) dan karakter tersembunyi
+        let cleaned = typeof data === 'string' 
+            ? data.replace(/[“”‘’]/g, '"').replace(/[\u0000-\u001F]+/g, " ")
+            : JSON.stringify(data);
+            
+        return typeof data === 'object' ? data : JSON.parse(cleaned);
     } catch (e) {
-        console.error('Failed parsing info.json:', fileId, e.message);
+        console.error('Error reading info.json:', e.message);
         return null;
     }
 }
 
-// Memindai seluruh struktur 3 tingkat: Root -> Team -> Show -> Files
 async function scanLibrary(force = false) {
     const now = Date.now();
     if (!force && CACHE.data && (now - CACHE.timestamp < CACHE.ttl)) {
@@ -132,25 +129,22 @@ async function scanLibrary(force = false) {
         const catalogId = 'team_' + tf.id;
         const teamChildren = await listDriveFolder(tf.id);
 
-        // Cari logo tim (logo.png / logo.jpg / logo.jpeg)
         const logoFile = teamChildren.find(f => isImage(f) && stripExt(f.name).toLowerCase() === 'logo');
         const teamLogoUrl = logoFile ? driveImageUrl(logoFile.id, 1000) : undefined;
 
         const showFolders = teamChildren
             .filter(f => f.mimeType === 'application/vnd.google-apps.folder')
-            .sort((a, b) => b.name.localeCompare(a.name)); // Terbaru di atas
+            .sort((a, b) => b.name.localeCompare(a.name));
 
         const shows = [];
 
         for (const sf of showFolders) {
             const files = await listDriveFolder(sf.id);
 
-            // Parse nama folder: YYYY-MM-DD Judul Show
             const dateMatch = sf.name.match(/^(\d{4}-\d{2}-\d{2})\s+(.+)$/);
             const folderDate = dateMatch ? dateMatch[1] : '';
             const folderTitle = dateMatch ? dateMatch[2].trim() : sf.name;
 
-            // Cek info.json jika ada
             const infoFile = files.find(f => f.name.toLowerCase() === 'info.json');
             const infoData = infoFile ? await fetchJsonFile(infoFile.id) : null;
 
@@ -158,7 +152,6 @@ async function scanLibrary(force = false) {
             const date = (infoData && infoData.date) || folderDate;
             const description = (infoData && infoData.description) || `Dokumentasi penampilan ${displayName} - ${title}`;
 
-            // Gambar pendukung (case-insensitive, mendukung .jpg, .jpeg, .png, .webp)
             const posterFile = files.find(f => isImage(f) && stripExt(f.name).toLowerCase() === 'poster');
             const bgFile = files.find(f => isImage(f) && stripExt(f.name).toLowerCase() === 'background');
             const showLogoFile = files.find(f => isImage(f) && stripExt(f.name).toLowerCase() === 'logo');
@@ -166,7 +159,6 @@ async function scanLibrary(force = false) {
             const videoFiles = files.filter(isVideo).sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
             const imageFiles = files.filter(isImage);
 
-            // Kelompokkan video ke Season 1 (Show), Season 2 (Rehearsal), Season 3 (Extras)
             const episodes = [];
             let s1Ep = 1, s2Ep = 1, s3Ep = 1;
 
@@ -177,10 +169,11 @@ async function scanLibrary(force = false) {
                 let season = 3;
                 let episode = 1;
 
-                if (/^show/i.test(lowerBase)) {
+                // Pengelompokan: Show = Season 1, Rehearsal = Season 2, Lainnya = Season 3
+                if (/^show/i.test(lowerBase)) {
                     season = 1;
                     episode = s1Ep++;
-                } else if (/^rehearsal/i.test(lowerBase)) {
+                } else if (/^rehearsal/i.test(lowerBase)) {
                     season = 2;
                     episode = s2Ep++;
                 } else {
@@ -188,19 +181,21 @@ async function scanLibrary(force = false) {
                     episode = s3Ep++;
                 }
 
-                // Cari thumbnail pasangan video (nama file sama persis tanpa ekstensi, jpg/png/jpeg)
                 const matchedThumb = imageFiles.find(img => stripExt(img.name).toLowerCase() === lowerBase);
                 const thumbUrl = matchedThumb
                     ? driveImageUrl(matchedThumb.id, 1280)
                     : (vf.thumbnailLink ? vf.thumbnailLink.replace(/=s\d+/, '=s1280') : driveImageUrl(vf.id, 1280));
 
+                // Ubah nama tampilan Season di Nuvio menjadi "Show 1", "Show 2", dst.
+                const seasonName = season === 1 ? `Show ${episode}` : (season === 2 ? `Rehearsal ${episode}` : `Extra ${episode}`);
+
                 episodes.push({
                     id: `${PREFIX}${sf.id}:${vf.id}`,
                     fileId: vf.id,
-                    title: baseName,
+                    title: `${baseName} (${seasonName})`,
                     fullTitle: `${title} – ${baseName}`,
-                    season,
-                    episode,
+                    season: season,
+                    episode: episode,
                     thumbnail: thumbUrl,
                     released: date ? `${date}T00:00:00.000Z` : undefined,
                     overview: `${baseName} • ${title} (${displayName})`
@@ -242,7 +237,6 @@ async function scanLibrary(force = false) {
     return CACHE.data;
 }
 
-// Bangun manifest dinamis berdasarkan folder tim di Drive
 async function getAddonInterface() {
     const lib = await scanLibrary();
     const catalogs = lib.teams.map(t => ({
@@ -252,7 +246,6 @@ async function getAddonInterface() {
         extra: [{ name: 'search', isRequired: false }, { name: 'skip', isRequired: false }]
     }));
 
-    // Fallback jika folder tim belum terbaca
     if (catalogs.length === 0) {
         catalogs.push({
             type: 'series',
@@ -264,7 +257,7 @@ async function getAddonInterface() {
 
     const manifest = {
         id: 'org.moveondancepro.library',
-        version: '1.0.0',
+        version: '1.0.2',
         name: 'Dance Library - Move On Dance Pro',
         description: 'Katalog resmi video dokumentasi show dan rehearsal Move On Dance Pro',
         resources: ['catalog', 'meta', 'stream'],
@@ -275,7 +268,6 @@ async function getAddonInterface() {
 
     const builder = new addonBuilder(manifest);
 
-    // 1. Catalog Handler
     builder.defineCatalogHandler(async (args) => {
         try {
             const libData = await scanLibrary();
@@ -309,12 +301,10 @@ async function getAddonInterface() {
 
             return { metas, cacheMaxAge: 300 };
         } catch (err) {
-            console.error('Catalog error:', err.message);
             return { metas: [] };
         }
     });
 
-    // 2. Meta Handler
     builder.defineMetaHandler(async (args) => {
         try {
             const libData = await scanLibrary();
@@ -346,101 +336,4 @@ async function getAddonInterface() {
                     };
                 }
             }
-            return { meta: { id: args.id, type: 'series', name: 'Show Not Found' } };
-        } catch (err) {
-            console.error('Meta error:', err.message);
-            return { meta: { id: args.id, type: 'series', name: 'Error' } };
-        }
-    });
-
-    // 3. Stream Handler
-    builder.defineStreamHandler(async (args) => {
-        try {
-            const raw = args.id.replace(PREFIX, '');
-            const [folderId, fileId] = raw.split(':');
-            if (!fileId) return { streams: [] };
-
-            const libData = await scanLibrary();
-            let teamName = 'Move On Dance Pro';
-            let videoLabel = 'Play Video';
-
-            for (const team of libData.teams) {
-                const show = team.shows.find(s => s.folderId === folderId);
-                if (show) {
-                    teamName = team.name;
-                    const ep = show.videos.find(v => v.fileId === fileId);
-                    if (ep) videoLabel = ep.fullTitle;
-                    break;
-                }
-            }
-
-            // Direct download link Google Drive (aman untuk file publik < 100MB, dan fallback dengan confirm)
-            const directUrl = GDRIVE_API_KEY
-                ? `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${GDRIVE_API_KEY}`
-                : `https://drive.usercontent.google.com/download?id=${fileId}&export=download&confirm=t`;
-
-            const streams = [
-                {
-                    name: teamName,
-                    title: `${videoLabel}\nGoogle Drive Direct Stream`,
-                    url: directUrl,
-                    behaviorHints: {
-                        notWebReady: false
-                    }
-                }
-            ];
-
-            return { streams, cacheMaxAge: 300 };
-        } catch (err) {
-            console.error('Stream error:', err.message);
-            return { streams: [] };
-        }
-    });
-
-    return builder.getInterface();
-}
-
-const app = express();
-app.use(cors());
-
-app.get('/', (req, res) => res.redirect('/manifest.json'));
-
-// Endpoint diagnosa untuk mengecek apakah Drive terbaca dengan benar
-app.get('/debug', async (req, res) => {
-    try {
-        const lib = await scanLibrary(req.query.refresh === '1');
-        res.json({
-            status: 'ok',
-            usingApiKey: !!GDRIVE_API_KEY,
-            teams: lib.teams.map(t => ({
-                name: t.name,
-                hasLogo: !!t.logo,
-                showsCount: t.shows.length,
-                shows: t.shows.map(s => ({
-                    title: s.title,
-                    date: s.date,
-                    hasPoster: !!s.poster,
-                    hasBackground: !!s.background,
-                    hasLogo: !!s.logo,
-                    videos: s.videos.map(v => ({ title: v.title, season: v.season, episode: v.episode }))
-                }))
-            }))
-        });
-    } catch (e) {
-        res.status(500).json({ status: 'error', message: e.message });
-    }
-});
-
-// Router dinamis Stremio
-app.use(async (req, res, next) => {
-    try {
-        const addonInterface = await getAddonInterface();
-        const router = getRouter(addonInterface);
-        router(req, res, next);
-    } catch (err) {
-        console.error('Router init error:', err.message);
-        res.status(500).json({ error: err.message });
-    }
-});
-
-module.exports = app;
+            return { meta: { id: args.id, type: 'series', name:
