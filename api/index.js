@@ -1,0 +1,446 @@
+const express = require('express');
+const cors = require('cors');
+const axios = require('axios');
+const { addonBuilder, getRouter } = require('stremio-addon-sdk');
+
+const GDRIVE_FOLDER_ID = process.env.GDRIVE_FOLDER_ID || '1wxqFA4Tz6swiZApr0tugxb-vIPZpPQWu';
+const GDRIVE_API_KEY = process.env.GDRIVE_API_KEY || '';
+const BASE_URL = process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : '';
+
+const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
+const PREFIX = 'modp_';
+
+// Cache sederhana di memory (berlaku selama instance serverless hangat)
+const CACHE = {
+    data: null,
+    timestamp: 0,
+    ttl: 10 * 60 * 1000 // 10 menit
+};
+
+const http = axios.create({
+    timeout: 10000,
+    headers: { 'User-Agent': UA }
+});
+
+// Helper: Ambil isi folder Drive menggunakan API Key (jika ada) atau scrape halaman folder publik
+async function listDriveFolder(folderId) {
+    if (GDRIVE_API_KEY) {
+        const files = [];
+        let pageToken = null;
+        do {
+            const { data } = await http.get('https://www.googleapis.com/drive/v3/files', {
+                params: {
+                    q: `'${folderId}' in parents and trashed = false`,
+                    fields: 'nextPageToken, files(id, name, mimeType, size, thumbnailLink, videoMediaMetadata)',
+                    pageSize: 100,
+                    pageToken: pageToken || undefined,
+                    key: GDRIVE_API_KEY
+                }
+            });
+            if (data && Array.isArray(data.files)) files.push(...data.files);
+            pageToken = data.nextPageToken;
+        } while (pageToken);
+        return files;
+    }
+
+    // Fallback tanpa API Key: parse embedded view Google Drive folder publik
+    const url = `https://drive.google.com/embeddedfolderview?id=${folderId}#list`;
+    const { data: html } = await http.get(url);
+    const items = [];
+    const entryRegex = /<div class="flip-entry" id="entry-([^"]+)"[\s\S]*?<div class="flip-entry-title">([^<]+)<\/div>/g;
+    let match;
+    while ((match = entryRegex.exec(html)) !== null) {
+        const id = match[1];
+        const name = match[2]
+            .replace(/&amp;/g, '&')
+            .replace(/&quot;/g, '"')
+            .replace(/&#39;/g, "'")
+            .replace(/&lt;/g, '<')
+            .replace(/&gt;/g, '>');
+        const blockStart = match.index;
+        const block = html.slice(blockStart, blockStart + 1200);
+        const isFolder = block.includes('drive/folders/') || block.includes('folder_');
+        items.push({
+            id,
+            name,
+            mimeType: isFolder ? 'application/vnd.google-apps.folder' : guessMime(name)
+        });
+    }
+    return items;
+}
+
+function guessMime(filename) {
+    const ext = filename.split('.').pop().toLowerCase();
+    if (['mp4', 'm4v'].includes(ext)) return 'video/mp4';
+    if (['mov'].includes(ext)) return 'video/quicktime';
+    if (['mkv'].includes(ext)) return 'video/x-matroska';
+    if (['jpg', 'jpeg'].includes(ext)) return 'image/jpeg';
+    if (['png'].includes(ext)) return 'image/png';
+    if (['webp'].includes(ext)) return 'image/webp';
+    if (ext === 'json') return 'application/json';
+    return 'application/octet-stream';
+}
+
+function isVideo(file) {
+    return (file.mimeType && file.mimeType.startsWith('video/')) || /\.(mp4|mov|mkv|m4v|avi)$/i.test(file.name);
+}
+
+function isImage(file) {
+    return (file.mimeType && file.mimeType.startsWith('image/')) || /\.(jpg|jpeg|png|webp)$/i.test(file.name);
+}
+
+function stripExt(filename) {
+    return filename.replace(/\.[^/.]+$/, '');
+}
+
+function driveImageUrl(fileId, width = 1000) {
+    return `https://lh3.googleusercontent.com/d/${fileId}=w${width}`;
+}
+
+async function fetchJsonFile(fileId) {
+    try {
+        const { data } = await http.get(`https://drive.google.com/uc?export=download&id=${fileId}`, {
+            responseType: 'text'
+        });
+        // Bersihkan smart quotes (“ ” ‘ ’) yang sering muncul saat copy-paste dari Mac/Notes
+        const cleaned = String(data)
+            .replace(/[“”]/g, '"')
+            .replace(/[‘’]/g, "'");
+        return JSON.parse(cleaned);
+    } catch (e) {
+        console.error('Failed parsing info.json:', fileId, e.message);
+        return null;
+    }
+}
+
+// Memindai seluruh struktur 3 tingkat: Root -> Team -> Show -> Files
+async function scanLibrary(force = false) {
+    const now = Date.now();
+    if (!force && CACHE.data && (now - CACHE.timestamp < CACHE.ttl)) {
+        return CACHE.data;
+    }
+
+    const rootItems = await listDriveFolder(GDRIVE_FOLDER_ID);
+    const teamFolders = rootItems
+        .filter(f => f.mimeType === 'application/vnd.google-apps.folder')
+        .sort((a, b) => a.name.localeCompare(b.name));
+
+    const teams = [];
+
+    for (const tf of teamFolders) {
+        const displayName = tf.name.replace(/^\d+\s+/, '').trim();
+        const catalogId = 'team_' + tf.id;
+        const teamChildren = await listDriveFolder(tf.id);
+
+        // Cari logo tim (logo.png / logo.jpg / logo.jpeg)
+        const logoFile = teamChildren.find(f => isImage(f) && stripExt(f.name).toLowerCase() === 'logo');
+        const teamLogoUrl = logoFile ? driveImageUrl(logoFile.id, 1000) : undefined;
+
+        const showFolders = teamChildren
+            .filter(f => f.mimeType === 'application/vnd.google-apps.folder')
+            .sort((a, b) => b.name.localeCompare(a.name)); // Terbaru di atas
+
+        const shows = [];
+
+        for (const sf of showFolders) {
+            const files = await listDriveFolder(sf.id);
+
+            // Parse nama folder: YYYY-MM-DD Judul Show
+            const dateMatch = sf.name.match(/^(\d{4}-\d{2}-\d{2})\s+(.+)$/);
+            const folderDate = dateMatch ? dateMatch[1] : '';
+            const folderTitle = dateMatch ? dateMatch[2].trim() : sf.name;
+
+            // Cek info.json jika ada
+            const infoFile = files.find(f => f.name.toLowerCase() === 'info.json');
+            const infoData = infoFile ? await fetchJsonFile(infoFile.id) : null;
+
+            const title = (infoData && infoData.title) || folderTitle;
+            const date = (infoData && infoData.date) || folderDate;
+            const description = (infoData && infoData.description) || `Dokumentasi penampilan ${displayName} - ${title}`;
+
+            // Gambar pendukung (case-insensitive, mendukung .jpg, .jpeg, .png, .webp)
+            const posterFile = files.find(f => isImage(f) && stripExt(f.name).toLowerCase() === 'poster');
+            const bgFile = files.find(f => isImage(f) && stripExt(f.name).toLowerCase() === 'background');
+            const showLogoFile = files.find(f => isImage(f) && stripExt(f.name).toLowerCase() === 'logo');
+
+            const videoFiles = files.filter(isVideo).sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+            const imageFiles = files.filter(isImage);
+
+            // Kelompokkan video ke Season 1 (Show), Season 2 (Rehearsal), Season 3 (Extras)
+            const episodes = [];
+            let s1Ep = 1, s2Ep = 1, s3Ep = 1;
+
+            for (const vf of videoFiles) {
+                const baseName = stripExt(vf.name);
+                const lowerBase = baseName.toLowerCase();
+
+                let season = 3;
+                let episode = 1;
+
+                if (/^show/i.test(lowerBase)) {
+                    season = 1;
+                    episode = s1Ep++;
+                } else if (/^rehearsal/i.test(lowerBase)) {
+                    season = 2;
+                    episode = s2Ep++;
+                } else {
+                    season = 3;
+                    episode = s3Ep++;
+                }
+
+                // Cari thumbnail pasangan video (nama file sama persis tanpa ekstensi, jpg/png/jpeg)
+                const matchedThumb = imageFiles.find(img => stripExt(img.name).toLowerCase() === lowerBase);
+                const thumbUrl = matchedThumb
+                    ? driveImageUrl(matchedThumb.id, 1280)
+                    : (vf.thumbnailLink ? vf.thumbnailLink.replace(/=s\d+/, '=s1280') : driveImageUrl(vf.id, 1280));
+
+                episodes.push({
+                    id: `${PREFIX}${sf.id}:${vf.id}`,
+                    fileId: vf.id,
+                    title: baseName,
+                    fullTitle: `${title} – ${baseName}`,
+                    season,
+                    episode,
+                    thumbnail: thumbUrl,
+                    released: date ? `${date}T00:00:00.000Z` : undefined,
+                    overview: `${baseName} • ${title} (${displayName})`
+                });
+            }
+
+            const firstThumb = episodes.length > 0 ? episodes[0].thumbnail : undefined;
+            const posterUrl = posterFile ? driveImageUrl(posterFile.id, 1000) : firstThumb;
+            const bgUrl = bgFile ? driveImageUrl(bgFile.id, 1920) : (posterUrl || firstThumb);
+            const logoUrl = showLogoFile ? driveImageUrl(showLogoFile.id, 1000) : teamLogoUrl;
+
+            shows.push({
+                id: `${PREFIX}${sf.id}`,
+                folderId: sf.id,
+                teamName: displayName,
+                catalogId,
+                title,
+                date,
+                releaseInfo: date ? date.slice(0, 4) : undefined,
+                description,
+                poster: posterUrl,
+                background: bgUrl,
+                logo: logoUrl,
+                videos: episodes
+            });
+        }
+
+        teams.push({
+            id: catalogId,
+            folderId: tf.id,
+            name: displayName,
+            logo: teamLogoUrl,
+            shows
+        });
+    }
+
+    CACHE.data = { teams };
+    CACHE.timestamp = now;
+    return CACHE.data;
+}
+
+// Bangun manifest dinamis berdasarkan folder tim di Drive
+async function getAddonInterface() {
+    const lib = await scanLibrary();
+    const catalogs = lib.teams.map(t => ({
+        type: 'series',
+        id: t.id,
+        name: t.name,
+        extra: [{ name: 'search', isRequired: false }, { name: 'skip', isRequired: false }]
+    }));
+
+    // Fallback jika folder tim belum terbaca
+    if (catalogs.length === 0) {
+        catalogs.push({
+            type: 'series',
+            id: 'team_default',
+            name: 'Move On Dance Pro',
+            extra: [{ name: 'search', isRequired: false }]
+        });
+    }
+
+    const manifest = {
+        id: 'org.moveondancepro.library',
+        version: '1.0.0',
+        name: 'Dance Library - Move On Dance Pro',
+        description: 'Katalog resmi video dokumentasi show dan rehearsal Move On Dance Pro',
+        resources: ['catalog', 'meta', 'stream'],
+        types: ['series'],
+        catalogs,
+        idPrefixes: [PREFIX]
+    };
+
+    const builder = new addonBuilder(manifest);
+
+    // 1. Catalog Handler
+    builder.defineCatalogHandler(async (args) => {
+        try {
+            const libData = await scanLibrary();
+            const team = libData.teams.find(t => t.id === args.id);
+            if (!team) return { metas: [] };
+
+            let list = team.shows;
+            if (args.extra && args.extra.search) {
+                const q = args.extra.search.toLowerCase().trim();
+                list = list.filter(s =>
+                    s.title.toLowerCase().includes(q) ||
+                    s.description.toLowerCase().includes(q) ||
+                    (s.date && s.date.includes(q))
+                );
+            }
+
+            const skip = parseInt(args.extra && args.extra.skip, 10) || 0;
+            const sliced = list.slice(skip, skip + 50);
+
+            const metas = sliced.map(s => ({
+                id: s.id,
+                type: 'series',
+                name: s.title,
+                poster: s.poster,
+                posterShape: 'poster',
+                background: s.background,
+                logo: s.logo,
+                releaseInfo: s.releaseInfo,
+                description: s.description
+            }));
+
+            return { metas, cacheMaxAge: 300 };
+        } catch (err) {
+            console.error('Catalog error:', err.message);
+            return { metas: [] };
+        }
+    });
+
+    // 2. Meta Handler
+    builder.defineMetaHandler(async (args) => {
+        try {
+            const libData = await scanLibrary();
+            for (const team of libData.teams) {
+                const show = team.shows.find(s => s.id === args.id);
+                if (show) {
+                    return {
+                        meta: {
+                            id: show.id,
+                            type: 'series',
+                            name: show.title,
+                            poster: show.poster,
+                            posterShape: 'poster',
+                            background: show.background,
+                            logo: show.logo,
+                            releaseInfo: show.releaseInfo,
+                            description: show.description,
+                            videos: show.videos.map(v => ({
+                                id: v.id,
+                                title: v.title,
+                                season: v.season,
+                                episode: v.episode,
+                                thumbnail: v.thumbnail,
+                                released: v.released,
+                                overview: v.overview
+                            }))
+                        },
+                        cacheMaxAge: 300
+                    };
+                }
+            }
+            return { meta: { id: args.id, type: 'series', name: 'Show Not Found' } };
+        } catch (err) {
+            console.error('Meta error:', err.message);
+            return { meta: { id: args.id, type: 'series', name: 'Error' } };
+        }
+    });
+
+    // 3. Stream Handler
+    builder.defineStreamHandler(async (args) => {
+        try {
+            const raw = args.id.replace(PREFIX, '');
+            const [folderId, fileId] = raw.split(':');
+            if (!fileId) return { streams: [] };
+
+            const libData = await scanLibrary();
+            let teamName = 'Move On Dance Pro';
+            let videoLabel = 'Play Video';
+
+            for (const team of libData.teams) {
+                const show = team.shows.find(s => s.folderId === folderId);
+                if (show) {
+                    teamName = team.name;
+                    const ep = show.videos.find(v => v.fileId === fileId);
+                    if (ep) videoLabel = ep.fullTitle;
+                    break;
+                }
+            }
+
+            // Direct download link Google Drive (aman untuk file publik < 100MB, dan fallback dengan confirm)
+            const directUrl = GDRIVE_API_KEY
+                ? `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${GDRIVE_API_KEY}`
+                : `https://drive.usercontent.google.com/download?id=${fileId}&export=download&confirm=t`;
+
+            const streams = [
+                {
+                    name: teamName,
+                    title: `${videoLabel}\nGoogle Drive Direct Stream`,
+                    url: directUrl,
+                    behaviorHints: {
+                        notWebReady: false
+                    }
+                }
+            ];
+
+            return { streams, cacheMaxAge: 300 };
+        } catch (err) {
+            console.error('Stream error:', err.message);
+            return { streams: [] };
+        }
+    });
+
+    return builder.getInterface();
+}
+
+const app = express();
+app.use(cors());
+
+app.get('/', (req, res) => res.redirect('/manifest.json'));
+
+// Endpoint diagnosa untuk mengecek apakah Drive terbaca dengan benar
+app.get('/debug', async (req, res) => {
+    try {
+        const lib = await scanLibrary(req.query.refresh === '1');
+        res.json({
+            status: 'ok',
+            usingApiKey: !!GDRIVE_API_KEY,
+            teams: lib.teams.map(t => ({
+                name: t.name,
+                hasLogo: !!t.logo,
+                showsCount: t.shows.length,
+                shows: t.shows.map(s => ({
+                    title: s.title,
+                    date: s.date,
+                    hasPoster: !!s.poster,
+                    hasBackground: !!s.background,
+                    hasLogo: !!s.logo,
+                    videos: s.videos.map(v => ({ title: v.title, season: v.season, episode: v.episode }))
+                }))
+            }))
+        });
+    } catch (e) {
+        res.status(500).json({ status: 'error', message: e.message });
+    }
+});
+
+// Router dinamis Stremio
+app.use(async (req, res, next) => {
+    try {
+        const addonInterface = await getAddonInterface();
+        const router = getRouter(addonInterface);
+        router(req, res, next);
+    } catch (err) {
+        console.error('Router init error:', err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+module.exports = app;
