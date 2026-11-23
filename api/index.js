@@ -16,7 +16,7 @@ const CACHE = {
 };
 
 const http = axios.create({
-    timeout: 10000,
+    timeout: 8000,
     headers: { 'User-Agent': UA }
 });
 
@@ -28,7 +28,7 @@ async function listDriveFolder(folderId) {
             const { data } = await http.get('https://www.googleapis.com/drive/v3/files', {
                 params: {
                     q: `'${folderId}' in parents and trashed = false`,
-                    fields: 'nextPageToken, files(id, name, mimeType, size, thumbnailLink, videoMediaMetadata)',
+                    fields: 'nextPageToken, files(id, name, mimeType, size, thumbnailLink)',
                     pageSize: 100,
                     pageToken: pageToken || undefined,
                     key: GDRIVE_API_KEY
@@ -40,39 +40,39 @@ async function listDriveFolder(folderId) {
         return files;
     }
 
-    const url = `https://drive.google.com/embeddedfolderview?id=${folderId}#list`;
-    const { data: html } = await http.get(url);
-    const items = [];
-    const entryRegex = /<div class="flip-entry" id="entry-([^"]+)"[\s\S]*?<div class="flip-entry-title">([^<]+)<\/div>/g;
-    let match;
-    while ((match = entryRegex.exec(html)) !== null) {
-        const id = match[1];
-        const name = match[2]
-            .replace(/&amp;/g, '&')
-            .replace(/&quot;/g, '"')
-            .replace(/&#39;/g, "'")
-            .replace(/&lt;/g, '<')
-            .replace(/&gt;/g, '>');
-        const blockStart = match.index;
-        const block = html.slice(blockStart, blockStart + 1200);
-        const isFolder = block.includes('drive/folders/') || block.includes('folder_');
-        items.push({
-            id,
-            name,
-            mimeType: isFolder ? 'application/vnd.google-apps.folder' : guessMime(name)
-        });
+    try {
+        const url = `https://drive.google.com/embeddedfolderview?id=${folderId}#list`;
+        const { data: html } = await http.get(url);
+        const items = [];
+        const entryRegex = /<div class="flip-entry" id="entry-([^"]+)"[\s\S]*?<div class="flip-entry-title">([^<]+)<\/div>/g;
+        let match;
+        while ((match = entryRegex.exec(html)) !== null) {
+            const id = match[1];
+            const name = match[2]
+                .replace(/&amp;/g, '&')
+                .replace(/&quot;/g, '"')
+                .replace(/&#39;/g, "'")
+                .replace(/&lt;/g, '<')
+                .replace(/&gt;/g, '>');
+            const blockStart = match.index;
+            const block = html.slice(blockStart, blockStart + 1200);
+            const isFolder = block.includes('drive/folders/') || block.includes('folder_');
+            items.push({
+                id,
+                name,
+                mimeType: isFolder ? 'application/vnd.google-apps.folder' : guessMime(name)
+            });
+        }
+        return items;
+    } catch (e) {
+        return [];
     }
-    return items;
 }
 
 function guessMime(filename) {
     const ext = filename.split('.').pop().toLowerCase();
-    if (['mp4', 'm4v'].includes(ext)) return 'video/mp4';
-    if (['mov'].includes(ext)) return 'video/quicktime';
-    if (['mkv'].includes(ext)) return 'video/x-matroska';
-    if (['jpg', 'jpeg'].includes(ext)) return 'image/jpeg';
-    if (['png'].includes(ext)) return 'image/png';
-    if (['webp'].includes(ext)) return 'image/webp';
+    if (['mp4', 'm4v', 'mov', 'mkv'].includes(ext)) return 'video/mp4';
+    if (['jpg', 'jpeg', 'png', 'webp'].includes(ext)) return 'image/jpeg';
     if (ext === 'json') return 'application/json';
     return 'application/octet-stream';
 }
@@ -96,18 +96,13 @@ function driveImageUrl(fileId, width = 1000) {
 async function fetchJsonFile(fileId) {
     try {
         const url = `https://drive.google.com/uc?export=download&id=${fileId}`;
-        const { data } = await http.get(url, { responseType: 'text' });
-        if (typeof data === 'string' && data.includes('<!DOCTYPE html>')) return null;
+        const { data } = await http.get(url, { responseType: 'text', timeout: 5000 });
+        if (!data || typeof data !== 'string' || data.includes('<!DOCTYPE html>')) return null;
         
-        // Membersihkan berbagai jenis tanda kutip miring (smart quotes) dan karakter tersembunyi
-        let cleaned = typeof data === 'string' 
-            ? data.replace(/[“”‘’]/g, '"').replace(/[\u0000-\u001F]+/g, " ")
-            : JSON.stringify(data);
-            
-        return typeof data === 'object' ? data : JSON.parse(cleaned);
+        let cleaned = data.replace(/[“”‘’]/g, '"').trim();
+        return JSON.parse(cleaned);
     } catch (e) {
-        console.error('Error reading info.json:', e.message);
-        return null;
+        return null; // Aman: jika gagal parse, tidak bikin error 500
     }
 }
 
@@ -169,7 +164,6 @@ async function scanLibrary(force = false) {
                 let season = 3;
                 let episode = 1;
 
-                // Pengelompokan: Show = Season 1, Rehearsal = Season 2, Lainnya = Season 3
                 if (/^show/i.test(lowerBase)) {
                     season = 1;
                     episode = s1Ep++;
@@ -186,7 +180,6 @@ async function scanLibrary(force = false) {
                     ? driveImageUrl(matchedThumb.id, 1280)
                     : (vf.thumbnailLink ? vf.thumbnailLink.replace(/=s\d+/, '=s1280') : driveImageUrl(vf.id, 1280));
 
-                // Ubah nama tampilan Season di Nuvio menjadi "Show 1", "Show 2", dst.
                 const seasonName = season === 1 ? `Show ${episode}` : (season === 2 ? `Rehearsal ${episode}` : `Extra ${episode}`);
 
                 episodes.push({
@@ -257,7 +250,7 @@ async function getAddonInterface() {
 
     const manifest = {
         id: 'org.moveondancepro.library',
-        version: '1.0.2',
+        version: '1.0.3',
         name: 'Dance Library - Move On Dance Pro',
         description: 'Katalog resmi video dokumentasi show dan rehearsal Move On Dance Pro',
         resources: ['catalog', 'meta', 'stream'],
@@ -336,4 +329,72 @@ async function getAddonInterface() {
                     };
                 }
             }
-            return { meta: { id: args.id, type: 'series', name:
+            return { meta: { id: args.id, type: 'series', name: 'Show Not Found' } };
+        } catch (err) {
+            return { meta: { id: args.id, type: 'series', name: 'Error' } };
+        }
+    });
+
+    builder.defineStreamHandler(async (args) => {
+        try {
+            const raw = args.id.replace(PREFIX, '');
+            const [folderId, fileId] = raw.split(':');
+            if (!fileId) return { streams: [] };
+
+            const libData = await scanLibrary();
+            let teamName = 'Move On Dance Pro';
+            let videoLabel = 'Play Video';
+
+            for (const team of libData.teams) {
+                const show = team.shows.find(s => s.folderId === folderId);
+                if (show) {
+                    teamName = team.name;
+                    const ep = show.videos.find(v => v.fileId === fileId);
+                    if (ep) videoLabel = ep.fullTitle;
+                    break;
+                }
+            }
+
+            const directUrl = GDRIVE_API_KEY
+                ? `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${GDRIVE_API_KEY}`
+                : `https://drive.usercontent.google.com/download?id=${fileId}&export=download&confirm=t`;
+
+            const streams = [
+                {
+                    name: teamName,
+                    title: `${videoLabel}\nGoogle Drive Direct Stream`,
+                    url: directUrl,
+                    behaviorHints: { notWebReady: false }
+                }
+            ];
+
+            return { streams, cacheMaxAge: 300 };
+        } catch (err) {
+            return { streams: [] };
+        }
+    });
+
+    return builder.getInterface();
+}
+
+const app = express();
+app.use(cors());
+
+app.get('/', (req, res) => res.redirect('/manifest.json'));
+
+app.get('/debug', async (req, res) => {
+    try {
+        const lib = await scanLibrary(req.query.refresh === '1');
+        res.json({
+            status: 'ok',
+            usingApiKey: !!GDRIVE_API_KEY,
+            teams: lib.teams.map(t => ({
+                name: t.name,
+                shows: t.shows.map(s => ({
+                    title: s.title,
+                    description: s.description,
+                    videos: s.videos.map(v => ({ title: v.title, season: v.season, episode: v.episode }))
+                }))
+            }))
+        });
+    } catch (e) {
