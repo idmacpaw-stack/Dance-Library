@@ -20,7 +20,6 @@ const http = axios.create({
     headers: { 'User-Agent': UA }
 });
 
-// Pemindaian folder menggunakan Google Drive API v3 resmi
 async function listDriveFolder(folderId) {
     if (!GDRIVE_API_KEY) {
         throw new Error('GDRIVE_API_KEY belum terbaca di Environment Variables Vercel.');
@@ -59,18 +58,16 @@ function driveImageUrl(fileId, width = 1000) {
     return `https://lh3.googleusercontent.com/d/${fileId}=w${width}`;
 }
 
-// Pembaca info.json yang kebal tanda kutip melengkung dan enter/baris baru
+// Menggunakan URL download langsung Google Drive agar isi info.json terbaca sempurna
 async function fetchJsonFile(fileId) {
-    if (!GDRIVE_API_KEY) return null;
     try {
-        const url = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${GDRIVE_API_KEY}`;
+        const url = `https://drive.google.com/uc?export=download&id=${fileId}`;
         const { data } = await http.get(url, { responseType: 'text', timeout: 5000 });
-        if (!data) return null;
+        if (!data || typeof data !== 'string' || data.includes('<!DOCTYPE html>')) return null;
 
-        const cleaned = String(data)
+        const cleaned = data
             .replace(/[\u201C\u201D]/g, '"')
             .replace(/[\u2018\u2019]/g, "'")
-            .replace(/[\r\n]+/g, ' ')
             .trim();
 
         return JSON.parse(cleaned);
@@ -224,7 +221,7 @@ async function getAddonInterface() {
 
     const manifest = {
         id: 'org.moveondancepro.library',
-        version: '1.0.7',
+        version: '1.0.8',
         name: 'Dance Library - Move On Dance Pro',
         description: 'Katalog resmi video dokumentasi show dan rehearsal Move On Dance Pro',
         resources: ['catalog', 'meta', 'stream'],
