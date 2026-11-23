@@ -12,7 +12,7 @@ const PREFIX = 'modp_';
 const CACHE = {
     data: null,
     timestamp: 0,
-    ttl: 5 * 60 * 1000 // 5 menit
+    ttl: 10 * 60 * 1000 // 10 menit
 };
 
 const http = axios.create({
@@ -20,8 +20,13 @@ const http = axios.create({
     headers: { 'User-Agent': UA }
 });
 
+// Fungsi pencarian file/folder menggunakan Google Drive API v3 (Wajib pakai GDRIVE_API_KEY di environment variables Vercel agar lancar)
 async function listDriveFolder(folderId) {
-    if (GDRIVE_API_KEY) {
+    if (!GDRIVE_API_KEY) {
+        // Fallback jika API Key belum dipasang: kembalikan struktur data statis/aman agar tidak error 500
+        return [];
+    }
+    try {
         const files = [];
         let pageToken = null;
         do {
@@ -38,33 +43,8 @@ async function listDriveFolder(folderId) {
             pageToken = data.nextPageToken;
         } while (pageToken);
         return files;
-    }
-
-    try {
-        const url = `https://drive.google.com/embeddedfolderview?id=${folderId}#list`;
-        const { data: html } = await http.get(url);
-        const items = [];
-        const entryRegex = /<div class="flip-entry" id="entry-([^"]+)"[\s\S]*?<div class="flip-entry-title">([^<]+)<\/div>/g;
-        let match;
-        while ((match = entryRegex.exec(html)) !== null) {
-            const id = match[1];
-            const name = match[2]
-                .replace(/&amp;/g, '&')
-                .replace(/&quot;/g, '"')
-                .replace(/&#39;/g, "'")
-                .replace(/&lt;/g, '<')
-                .replace(/&gt;/g, '>');
-            const blockStart = match.index;
-            const block = html.slice(blockStart, blockStart + 1200);
-            const isFolder = block.includes('drive/folders/') || block.includes('folder_');
-            items.push({
-                id,
-                name,
-                mimeType: isFolder ? 'application/vnd.google-apps.folder' : guessMime(name)
-            });
-        }
-        return items;
     } catch (e) {
+        console.error('Drive API Error:', e.message);
         return [];
     }
 }
@@ -94,15 +74,13 @@ function driveImageUrl(fileId, width = 1000) {
 }
 
 async function fetchJsonFile(fileId) {
+    if (!GDRIVE_API_KEY) return null;
     try {
-        const url = `https://drive.google.com/uc?export=download&id=${fileId}`;
-        const { data } = await http.get(url, { responseType: 'text', timeout: 5000 });
-        if (!data || typeof data !== 'string' || data.includes('<!DOCTYPE html>')) return null;
-        
-        let cleaned = data.replace(/[“”‘’]/g, '"').trim();
-        return JSON.parse(cleaned);
+        const url = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${GDRIVE_API_KEY}`;
+        const { data } = await http.get(url, { responseType: 'json', timeout: 5000 });
+        return data && typeof data === 'object' ? data : null;
     } catch (e) {
-        return null; // Aman: jika gagal parse, tidak bikin error 500
+        return null;
     }
 }
 
@@ -250,7 +228,7 @@ async function getAddonInterface() {
 
     const manifest = {
         id: 'org.moveondancepro.library',
-        version: '1.0.3',
+        version: '1.0.4',
         name: 'Dance Library - Move On Dance Pro',
         description: 'Katalog resmi video dokumentasi show dan rehearsal Move On Dance Pro',
         resources: ['catalog', 'meta', 'stream'],
@@ -321,80 +299,4 @@ async function getAddonInterface() {
                                 season: v.season,
                                 episode: v.episode,
                                 thumbnail: v.thumbnail,
-                                released: v.released,
-                                overview: v.overview
-                            }))
-                        },
-                        cacheMaxAge: 300
-                    };
-                }
-            }
-            return { meta: { id: args.id, type: 'series', name: 'Show Not Found' } };
-        } catch (err) {
-            return { meta: { id: args.id, type: 'series', name: 'Error' } };
-        }
-    });
-
-    builder.defineStreamHandler(async (args) => {
-        try {
-            const raw = args.id.replace(PREFIX, '');
-            const [folderId, fileId] = raw.split(':');
-            if (!fileId) return { streams: [] };
-
-            const libData = await scanLibrary();
-            let teamName = 'Move On Dance Pro';
-            let videoLabel = 'Play Video';
-
-            for (const team of libData.teams) {
-                const show = team.shows.find(s => s.folderId === folderId);
-                if (show) {
-                    teamName = team.name;
-                    const ep = show.videos.find(v => v.fileId === fileId);
-                    if (ep) videoLabel = ep.fullTitle;
-                    break;
-                }
-            }
-
-            const directUrl = GDRIVE_API_KEY
-                ? `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${GDRIVE_API_KEY}`
-                : `https://drive.usercontent.google.com/download?id=${fileId}&export=download&confirm=t`;
-
-            const streams = [
-                {
-                    name: teamName,
-                    title: `${videoLabel}\nGoogle Drive Direct Stream`,
-                    url: directUrl,
-                    behaviorHints: { notWebReady: false }
-                }
-            ];
-
-            return { streams, cacheMaxAge: 300 };
-        } catch (err) {
-            return { streams: [] };
-        }
-    });
-
-    return builder.getInterface();
-}
-
-const app = express();
-app.use(cors());
-
-app.get('/', (req, res) => res.redirect('/manifest.json'));
-
-app.get('/debug', async (req, res) => {
-    try {
-        const lib = await scanLibrary(req.query.refresh === '1');
-        res.json({
-            status: 'ok',
-            usingApiKey: !!GDRIVE_API_KEY,
-            teams: lib.teams.map(t => ({
-                name: t.name,
-                shows: t.shows.map(s => ({
-                    title: s.title,
-                    description: s.description,
-                    videos: s.videos.map(v => ({ title: v.title, season: v.season, episode: v.episode }))
-                }))
-            }))
-        });
-    } catch (e) {
+                                released: v.released
