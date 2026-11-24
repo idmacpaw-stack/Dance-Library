@@ -111,11 +111,19 @@ async function scanLibrary(force = false) {
             const imageFiles = showItems.filter(isImage);
             const allVideos = showItems.filter(isVideo);
 
-            // Pisahkan file trailer (trailer.mp4 / trailer.mov) agar tidak masuk ke daftar episode
-            const trailerFile = allVideos.find(f => /^trailer\./i.test(f.name));
-            const videoFiles = allVideos.filter(f => !/^trailer\./i.test(f.name));
+            if (allVideos.length === 0) continue;
 
-            if (videoFiles.length === 0) continue;
+            // Cari file trailer secara aman (tidak wajib ada)
+            const trailerFile = allVideos.find(f => f.name.toLowerCase().startsWith('trailer'));
+            
+            // Daftar video episode adalah semua video KECUALI file trailer (jika ada)
+            const videoFiles = allVideos.filter(f => {
+                if (!trailerFile) return true;
+                return f.id !== trailerFile.id;
+            });
+
+            // Jika karena suatu hal videoFiles kosong tapi allVideos ada, fallback pakai semua
+            const finalVideos = videoFiles.length > 0 ? videoFiles : allVideos;
 
             // Baca info.json jika ada
             let metaInfo = {};
@@ -134,20 +142,18 @@ async function scanLibrary(force = false) {
             const releaseInfo = metaInfo.releaseInfo || metaInfo.year || '2026';
             const date = metaInfo.date || '';
 
-            // Link stream langsung untuk trailer jika file trailer ditemukan
             const trailerUrl = trailerFile
                 ? (GDRIVE_API_KEY
                     ? `https://www.googleapis.com/drive/v3/files/${trailerFile.id}?alt=media&key=${GDRIVE_API_KEY}`
                     : `https://drive.usercontent.google.com/download?id=${trailerFile.id}&export=download&confirm=t`)
                 : null;
 
-            // Urutkan video berdasarkan nama
-            videoFiles.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+            finalVideos.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
 
             const episodes = [];
             let epNum = 1;
 
-            for (const vf of videoFiles) {
+            for (const vf of finalVideos) {
                 const baseName = stripExt(vf.name);
                 const matchedThumb = imageFiles.find(img => stripExt(img.name).toLowerCase() === baseName.toLowerCase());
                 const thumbUrl = matchedThumb
@@ -216,7 +222,7 @@ async function getAddonInterface() {
 
     const manifest = {
         id: 'org.moveondancepro.library',
-        version: '1.1.3',
+        version: '1.1.4',
         name: 'Dance Library - Move On Dance Pro',
         description: 'Katalog resmi video dokumentasi Move On Dance Pro',
         resources: ['catalog', 'meta', 'stream'],
@@ -281,7 +287,6 @@ async function getAddonInterface() {
                             logo: show.logo,
                             releaseInfo: show.releaseInfo,
                             description: show.description,
-                            // Klip trailer otomatis muncul jika ada file trailer.mp4/mov di folder show
                             trailerStreams: show.trailerUrl ? [
                                 {
                                     title: `${show.title} - Official Trailer`,
@@ -358,7 +363,7 @@ app.get('/', (req, res) => res.redirect('/manifest.json'));
 app.get('/debug', async (req, res) => {
     try {
         const lib = await scanLibrary(req.query.refresh === '1');
-        res.json({
+    res.json({
             status: 'ok',
             usingApiKey: !!GDRIVE_API_KEY,
             teams: lib.teams.map(t => ({
