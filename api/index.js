@@ -3,15 +3,16 @@ const cors = require('cors');
 const axios = require('axios');
 const { addonBuilder, getRouter } = require('stremio-addon-sdk');
 
-const GDRIVE_API_KEY = process.env.GDRIVE_API_KEY;
-const GDRIVE_FOLDER_ID = process.env.GDRIVE_FOLDER_ID;
+const GDRIVE_FOLDER_ID = process.env.GDRIVE_FOLDER_ID || '1wxqFA4Tz6swiZApr0tugxb-vIPZpPQWu';
+const GDRIVE_API_KEY = (process.env.GDRIVE_API_KEY || '').trim();
+
+const UA = 'Mozilla/5.0 (Macintosh; Intel OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
 const PREFIX = 'modp_';
-const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36';
 
 const CACHE = {
     data: null,
     timestamp: 0,
-    ttl: 15 * 60 * 1000 // Cache 15 menit
+    ttl: 15 * 60 * 1000 // Cache diperpanjang jadi 15 menit agar ngebut
 };
 
 const http = axios.create({
@@ -47,15 +48,15 @@ async function listDriveFolder(folderId) {
 }
 
 function isVideo(file) {
-    return file.mimeType && file.mimeType.startsWith('video/');
+    return (file.mimeType && file.mimeType.startsWith('video/')) || /\.(mp4|mov|mkv|m4v|avi)$/i.test(file.name);
 }
 
 function isImage(file) {
-    return file.mimeType && file.mimeType.startsWith('image/');
+    return (file.mimeType && file.mimeType.startsWith('image/')) || /\.(jpg|jpeg|png|webp)$/i.test(file.name);
 }
 
 function stripExt(filename) {
-    return filename.replace(/\.[^/.]+$/, '').replace(/\s*\([^)]*\)/g, '').trim();
+    return filename.replace(/\.[^/.]+$/, '');
 }
 
 function driveImageUrl(fileId, width = 1000) {
@@ -69,13 +70,12 @@ async function fetchJsonFile(fileId) {
         if (!data || typeof data !== 'string' || data.includes('<!DOCTYPE html>')) return null;
 
         const cleaned = data
-            .replace(/^\uFEFF/, '')
             .replace(/[\u201C\u201D]/g, '"')
-            .replace(/[\u2018\u2019]/g, "'");
+            .replace(/[\u2018\u2019]/g, "'")
+            .trim();
 
         return JSON.parse(cleaned);
     } catch (e) {
-        console.error('Gagal baca info.json:', e.message);
         return null;
     }
 }
@@ -86,74 +86,57 @@ async function scanLibrary(force = false) {
         return CACHE.data;
     }
 
-    if (!GDRIVE_FOLDER_ID) {
-        throw new Error('GDRIVE_FOLDER_ID belum terbaca di Environment Variables Vercel.');
-    }
-
     const rootItems = await listDriveFolder(GDRIVE_FOLDER_ID);
-    const teamFolders = rootItems.filter(f => f.mimeType === 'application/vnd.google-apps.folder');
+    const teamFolders = rootItems
+        .filter(f => f.mimeType === 'application/vnd.google-apps.folder')
+        .sort((a, b) => a.name.localeCompare(b.name));
 
     const teams = [];
 
     for (const tf of teamFolders) {
-        const displayName = tf.name.replace(/\s*\([^)]*\)/g, '').trim();
-        const catalogId = `team_${tf.id}`;
-        const teamItems = await listDriveFolder(tf.id);
+        const displayName = tf.name.replace(/^\d+\s+/, '').trim();
+        const catalogId = 'team_' + tf.id;
+        const teamChildren = await listDriveFolder(tf.id);
 
-        const teamLogoFile = teamItems.find(f => isImage(f) && /^logo/i.test(f.name));
-        const teamLogoUrl = teamLogoFile ? driveImageUrl(teamLogoFile.id, 800) : undefined;
+        const logoFile = teamChildren.find(f => isImage(f) && stripExt(f.name).toLowerCase() === 'logo');
+        const teamLogoUrl = logoFile ? driveImageUrl(logoFile.id, 1000) : undefined;
 
-        const showFolders = teamItems.filter(f => f.mimeType === 'application/vnd.google-apps.folder');
+        const showFolders = teamChildren
+            .filter(f => f.mimeType === 'application/vnd.google-apps.folder')
+            .sort((a, b) => b.name.localeCompare(a.name));
+
         const shows = [];
 
         for (const sf of showFolders) {
-            const showItems = await listDriveFolder(sf.id);
-            const imageFiles = showItems.filter(isImage);
-            const allVideos = showItems.filter(isVideo);
+            const files = await listDriveFolder(sf.id);
 
-            if (allVideos.length === 0) continue;
+            const dateMatch = sf.name.match(/^(\d{4}-\d{2}-\d{2})\s+(.+)$/);
+            const folderDate = dateMatch ? dateMatch[1] : '';
+            const folderTitle = dateMatch ? dateMatch[2].trim() : sf.name;
 
-            // Cari file trailer secara aman (tidak wajib ada)
-            const trailerFile = allVideos.find(f => f.name.toLowerCase().startsWith('trailer'));
-            
-            // Daftar video episode adalah semua video KECUALI file trailer (jika ada)
-            const videoFiles = allVideos.filter(f => {
-                if (!trailerFile) return true;
-                return f.id !== trailerFile.id;
-            });
+            const infoFile = files.find(f => f.name.toLowerCase() === 'info.json');
+            const infoData = infoFile ? await fetchJsonFile(infoFile.id) : null;
 
-            // Jika karena suatu hal videoFiles kosong tapi allVideos ada, fallback pakai semua
-            const finalVideos = videoFiles.length > 0 ? videoFiles : allVideos;
+            const title = (infoData && infoData.title) || folderTitle;
+            const date = (infoData && infoData.date) || folderDate;
+            const description = (infoData && infoData.description) || `Dokumentasi penampilan ${displayName} - ${title}`;
 
-            // Baca info.json jika ada
-            let metaInfo = {};
-            const jsonFile = showItems.find(f => f.name.toLowerCase() === 'info.json');
-            if (jsonFile) {
-                const parsed = await fetchJsonFile(jsonFile.id);
-                if (parsed) metaInfo = parsed;
-            }
+            const posterFile = files.find(f => isImage(f) && stripExt(f.name).toLowerCase() === 'poster');
+            const bgFile = files.find(f => isImage(f) && stripExt(f.name).toLowerCase() === 'background');
+            const showLogoFile = files.find(f => isImage(f) && stripExt(f.name).toLowerCase() === 'logo');
 
-            const posterFile = imageFiles.find(f => /^poster/i.test(f.name)) || imageFiles[0];
-            const bgFile = imageFiles.find(f => /^background/i.test(f.name)) || posterFile;
-            const logoFile = imageFiles.find(f => /^logo/i.test(f.name));
+            const allVideoFiles = files.filter(isVideo);
+            const trailerFile = allVideoFiles.find(f => stripExt(f.name).toLowerCase() === 'trailer');
+            const videoFiles = allVideoFiles
+                .filter(f => !trailerFile || f.id !== trailerFile.id)
+                .sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
 
-            const title = metaInfo.title || sf.name.replace(/\s*\([^)]*\)/g, '').trim();
-            const description = metaInfo.description || `Dokumentasi resmi ${title} oleh ${displayName}.`;
-            const releaseInfo = metaInfo.releaseInfo || metaInfo.year || '2026';
-            const date = metaInfo.date || '';
-
-            const trailerUrl = trailerFile
-                ? (GDRIVE_API_KEY
-                    ? `https://www.googleapis.com/drive/v3/files/${trailerFile.id}?alt=media&key=${GDRIVE_API_KEY}`
-                    : `https://drive.usercontent.google.com/download?id=${trailerFile.id}&export=download&confirm=t`)
-                : null;
-
-            finalVideos.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+            const imageFiles = files.filter(isImage);
 
             const episodes = [];
             let epNum = 1;
 
-            for (const vf of finalVideos) {
+            for (const vf of videoFiles) {
                 const baseName = stripExt(vf.name);
                 const matchedThumb = imageFiles.find(img => stripExt(img.name).toLowerCase() === baseName.toLowerCase());
                 const thumbUrl = matchedThumb
@@ -173,16 +156,29 @@ async function scanLibrary(force = false) {
                 });
             }
 
+            const firstThumb = episodes.length > 0 ? episodes[0].thumbnail : undefined;
+            const posterUrl = posterFile ? driveImageUrl(posterFile.id, 1000) : firstThumb;
+            const bgUrl = bgFile ? driveImageUrl(bgFile.id, 1920) : (posterUrl || firstThumb);
+            const logoUrl = showLogoFile ? driveImageUrl(showLogoFile.id, 1000) : teamLogoUrl;
+
+            const trailerUrl = trailerFile
+                ? (GDRIVE_API_KEY
+                    ? `https://www.googleapis.com/drive/v3/files/${trailerFile.id}?alt=media&key=${GDRIVE_API_KEY}`
+                    : `https://drive.usercontent.google.com/download?id=${trailerFile.id}&export=download&confirm=t`)
+                : undefined;
+
             shows.push({
                 id: `${PREFIX}${sf.id}`,
                 folderId: sf.id,
+                teamName: displayName,
+                catalogId,
                 title,
-                poster: metaInfo.poster || (posterFile ? driveImageUrl(posterFile.id, 1000) : undefined),
-                background: metaInfo.background || (bgFile ? driveImageUrl(bgFile.id, 1920) : undefined),
-                logo: metaInfo.logo || (logoFile ? driveImageUrl(logoFile.id, 800) : undefined),
-                releaseInfo: String(releaseInfo),
                 date,
+                releaseInfo: date ? date.slice(0, 4) : undefined,
                 description,
+                poster: posterUrl,
+                background: bgUrl,
+                logo: logoUrl,
                 trailerUrl,
                 videos: episodes
             });
@@ -222,7 +218,7 @@ async function getAddonInterface() {
 
     const manifest = {
         id: 'org.moveondancepro.library',
-        version: '1.1.4',
+        version: '1.1.2',
         name: 'Dance Library - Move On Dance Pro',
         description: 'Katalog resmi video dokumentasi Move On Dance Pro',
         resources: ['catalog', 'meta', 'stream'],
@@ -276,33 +272,38 @@ async function getAddonInterface() {
             for (const team of libData.teams) {
                 const show = team.shows.find(s => s.id === args.id);
                 if (show) {
+                    const metaObj = {
+                        id: show.id,
+                        type: 'series',
+                        name: show.title,
+                        poster: show.poster,
+                        posterShape: 'poster',
+                        background: show.background,
+                        logo: show.logo,
+                        releaseInfo: show.releaseInfo,
+                        description: show.description,
+                        videos: show.videos.map(v => ({
+                            id: v.id,
+                            title: v.title,
+                            season: v.season,
+                            episode: v.episode,
+                            thumbnail: v.thumbnail,
+                            released: v.released,
+                            overview: v.overview
+                        }))
+                    };
+
+                    if (show.trailerUrl) {
+                        metaObj.trailerStreams = [
+                            {
+                                title: `${show.title} - Trailer`,
+                                url: show.trailerUrl
+                            }
+                        ];
+                    }
+
                     return {
-                        meta: {
-                            id: show.id,
-                            type: 'series',
-                            name: show.title,
-                            poster: show.poster,
-                            posterShape: 'poster',
-                            background: show.background,
-                            logo: show.logo,
-                            releaseInfo: show.releaseInfo,
-                            description: show.description,
-                            trailerStreams: show.trailerUrl ? [
-                                {
-                                    title: `${show.title} - Official Trailer`,
-                                    url: show.trailerUrl
-                                }
-                            ] : [],
-                            videos: show.videos.map(v => ({
-                                id: v.id,
-                                title: v.title,
-                                season: v.season,
-                                episode: v.episode,
-                                thumbnail: v.thumbnail,
-                                released: v.released,
-                                overview: v.overview
-                            }))
-                        },
+                        meta: metaObj,
                         cacheMaxAge: 300
                     };
                 }
@@ -363,7 +364,7 @@ app.get('/', (req, res) => res.redirect('/manifest.json'));
 app.get('/debug', async (req, res) => {
     try {
         const lib = await scanLibrary(req.query.refresh === '1');
-    res.json({
+        res.json({
             status: 'ok',
             usingApiKey: !!GDRIVE_API_KEY,
             teams: lib.teams.map(t => ({
