@@ -6,7 +6,7 @@ const { addonBuilder, getRouter } = require('stremio-addon-sdk');
 const GDRIVE_FOLDER_ID = process.env.GDRIVE_FOLDER_ID || '1wxqFA4Tz6swiZApr0tugxb-vIPZpPQWu';
 const GDRIVE_API_KEY = (process.env.GDRIVE_API_KEY || '').trim();
 
-const UA = 'Mozilla/5.0 (Macintosh; Intel OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
+const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
 const PREFIX = 'modp_';
 
 const CACHE = {
@@ -126,7 +126,11 @@ async function scanLibrary(force = false) {
             const showLogoFile = files.find(f => isImage(f) && stripExt(f.name).toLowerCase() === 'logo');
 
             const allVideoFiles = files.filter(isVideo);
+            
+            // Deteksi file trailer di dalam folder (misal: trailer.mp4 / trailer.mov)
             const trailerFile = allVideoFiles.find(f => stripExt(f.name).toLowerCase() === 'trailer');
+            
+            // Saring agar file trailer tidak masuk ke daftar episode Season 1
             const videoFiles = allVideoFiles
                 .filter(f => !trailerFile || f.id !== trailerFile.id)
                 .sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
@@ -161,6 +165,7 @@ async function scanLibrary(force = false) {
             const bgUrl = bgFile ? driveImageUrl(bgFile.id, 1920) : (posterUrl || firstThumb);
             const logoUrl = showLogoFile ? driveImageUrl(showLogoFile.id, 1000) : teamLogoUrl;
 
+            // URL streaming langsung untuk file trailer Google Drive
             const trailerUrl = trailerFile
                 ? (GDRIVE_API_KEY
                     ? `https://www.googleapis.com/drive/v3/files/${trailerFile.id}?alt=media&key=${GDRIVE_API_KEY}`
@@ -293,11 +298,13 @@ async function getAddonInterface() {
                         }))
                     };
 
+                    // Menyediakan trailer langsung dari file Google Drive ke Nuvio/Stremio
                     if (show.trailerUrl) {
                         metaObj.trailerStreams = [
                             {
                                 title: `${show.title} - Trailer`,
-                                url: show.trailerUrl
+                                url: show.trailerUrl,
+                                behaviorHints: { notWebReady: true }
                             }
                         ];
                     }
@@ -369,12 +376,12 @@ app.get('/debug', async (req, res) => {
             usingApiKey: !!GDRIVE_API_KEY,
             teams: lib.teams.map(t => ({
                 name: t.name,
-                shows: t.shows.map(s => ({
+                shows: t.shows.shows ? t.shows.map(s => ({
                     title: s.title,
                     hasTrailer: !!s.trailerUrl,
                     description: s.description,
                     videos: s.videos.map(v => ({ title: v.title, season: v.season, episode: v.episode }))
-                }))
+                })) : []
             }))
         });
     } catch (e) {
